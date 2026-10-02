@@ -18,7 +18,8 @@ from app.config import Settings, get_settings
 from app.conversation import ConversationStore
 from app.deps import RateLimiter, client_ip, require_api_key
 from app.openai_client import get_client
-from app.prompts import SYSTEM_PROMPT
+from app.prompts import SYSTEM_PROMPT, rag_system_prompt
+from app.rag import RetrievalError, build_sources, format_context, retrieve
 from app.schemas import ChatRequest, ChatResponse, HealthResponse
 
 logger = logging.getLogger("nutriconcurso")
@@ -78,6 +79,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status="ok",
             configured=settings.is_configured,
             model=settings.openai_model,
+            rag_configured=settings.is_rag_configured,
+            embedding_model=settings.embedding_model if settings.is_rag_configured else None,
         )
 
     @app.post("/api/v1/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
@@ -104,19 +107,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Servidor sem OPENAI_API_KEY configurada.",
             )
 
+        # Mesmo cliente para o embedding e para a resposta: uma conexão, um
+        # timeout, uma configuração.
+        client: OpenAI = get_client(settings)
+
+        # Busca vetorial antes de chamar o modelo. Uma falha aqui NÃO é
+        # degradada para resposta sem contexto: nesse modo o tutor falaria
+        # memória do modelo parecendo fundamento oficial, que é exatamente o
+        # risco que o RAG existe para evitar. Melhor 503 e o app avisar.
+        context = ""
+        sources: list = []
+        rag_used = False
+        if settings.is_rag_configured:
+            try:
+                chunks = retrieve(settings, message, client)
+            except RetrievalError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc),
+                ) from exc
+
+            context = format_context(
+                chunks,
+                max_chunk_chars=settings.rag_max_chunk_chars,
+                max_total_chars=settings.rag_max_context_chars,
+            )
+            sources = build_sources(chunks)
+            rag_used = bool(chunks)
+
+        system_prompt = rag_system_prompt(context) if rag_used else SYSTEM_PROMPT
+
         user_id = (request.user_id or "").strip() or None
         history = conversation_store.append_user_message(user_id, message)
 
-        try:
-            client: OpenAI = get_client(settings)
-            completion = client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}, *history],
-                temperature=0.3,
-                max_tokens=settings.openai_max_tokens,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        completion = client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[{"role": "system", "content": system_prompt}, *history],
+            temperature=0.3,
+            max_tokens=settings.openai_max_tokens,
+        )
 
         reply = completion.choices[0].message.content
         if not reply:
@@ -128,7 +157,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         conversation_store.append_assistant_message(user_id, reply)
 
-        return ChatResponse(reply=reply, has_history=user_id is not None)
+        return ChatResponse(
+            reply=reply,
+            has_history=user_id is not None,
+            sources=sources,
+            rag_used=rag_used,
+        )
 
     @app.delete("/api/v1/chat", dependencies=[Depends(require_api_key)])
     async def clear_conversation(

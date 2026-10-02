@@ -3,3 +3,5 @@ uvicorn[standard]==0.54.0
 openai==3.23.0
 pydantic==2.13.5
 pydantic-settings==2.15.0
+supabase==2.31.0
+pypdf==6.4.0
