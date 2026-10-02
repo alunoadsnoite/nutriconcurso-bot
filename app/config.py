@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     history_ttl_seconds: int = 3600
 
     requests_per_minute: int = 20
+    # Orçamento por pessoa. O limite por IP segura robô; este segura um aluno
+    # (ou um app modificado) de consumir a conta inteira de uma vez. `0`
+    # desliga. Só vale quando a requisição traz `user_id`.
+    requests_per_minute_per_user: int = 12
+
+    # Só liga com `trust_proxy=true` se existir um proxy que reescreva o
+    # cabeçalho. Ligado sem proxy, qualquer um burla o limite mandando
+    # `X-Forwarded-For` diferente a cada requisição.
+    trust_proxy: bool = False
 
     # ---------------------------------------------------------------- RAG ---
     # Busca vetorial no Supabase (pgvector). Vazio = RAG desligado e o chat
@@ -59,6 +68,25 @@ class Settings(BaseSettings):
     # de PDF estouram a janela de contexto e a resposta sai truncada ou cara.
     rag_max_chunk_chars: int = 1200
     rag_max_context_chars: int = 8000
+
+    # Busca híbrida: vetorial + full-text em português, combinadas por RRF.
+    # Não precisa de modelo extra e acha o que a vetorial erra, quando a
+    # pergunta usa vocabulário diferente do documento ("merenda" contra
+    # "alimentos").
+    #
+    # DESLIGADA por padrão, e o motivo é honesto: ela depende da coluna
+    # gerada `content_tsv` e da função `match_documents_hybrid`, que só
+    # existem depois de rodar migrations/002_busca_hibrida.sql. Não há teste
+    # automatizado que rode contra um Postgres de verdade aqui, então ligar
+    # por padrão seria entregar um caminho não verificado no caminho crítico.
+    # O comentário de verificação está no fim da própria migration.
+    rag_hybrid: bool = False
+    rag_rrf_k: int = 60
+
+    # Perguntas sugeridas depois da resposta. Uma chamada extra, pequena e
+    # barata, em modelo de saída JSON. `0` desliga.
+    suggestions_count: int = 3
+    suggestions_max_tokens: int = 150
 
     @property
     def is_configured(self) -> bool:

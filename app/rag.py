@@ -46,6 +46,10 @@ class RetrievedChunk:
     source: str
     page: int | None = None
     similarity: float | None = None
+    # Score fundido do RRF, só na busca híbrida. `None` na busca só vetorial.
+    # Serve para ORDENAR; nunca substitui `similarity`, que é o que o limiar e
+    # a interface entendem.
+    score: float | None = None
 
 
 @lru_cache
@@ -123,13 +127,14 @@ def _normalize_metadata(raw: object) -> dict:
     return {}
 
 
-def _normalize_similarity(value: object) -> float | None:
+def _normalize_number(value: object) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if number == number else None  # descarta NaN
 
 
 def _row_to_chunk(row: object, *, threshold: float) -> RetrievedChunk | None:
@@ -140,9 +145,13 @@ def _row_to_chunk(row: object, *, threshold: float) -> RetrievedChunk | None:
     if not isinstance(content, str) or not content.strip():
         return None
 
-    similarity = _normalize_similarity(row.get("similarity"))
+    similarity = _normalize_number(row.get("similarity"))
     # A função SQL já filtra por limiar. Repetimos aqui para proteger contra uma
     # função desatualizada no banco devolvendo trecho fora do corte.
+    #
+    # `similarity is None` é o caso legítimo da busca híbrida: o trecho entrou
+    # só pela busca textual, então não existe cosseno para ele. Descartar
+    # nesses casos mataria exatamente o que a híbrida foi criada para achar.
     if similarity is not None and similarity <= threshold:
         return None
 
@@ -154,6 +163,7 @@ def _row_to_chunk(row: object, *, threshold: float) -> RetrievedChunk | None:
         source=str(source),
         page=_normalize_page(metadata.get("page")),
         similarity=similarity,
+        score=_normalize_number(row.get("score")),
     )
 
 
@@ -169,14 +179,26 @@ def retrieve(settings: Settings, question: str, client) -> list[RetrievedChunk]:
     embedding = _embed(client, settings, question)
 
     try:
-        rpc = store.rpc(
-            "match_documents",
-            {
-                "query_embedding": embedding,
-                "match_threshold": threshold,
-                "match_count": settings.rag_match_count,
-            },
-        )
+        if settings.rag_hybrid:
+            rpc = store.rpc(
+                "match_documents_hybrid",
+                {
+                    "query_embedding": embedding,
+                    "query_text": question,
+                    "match_threshold": threshold,
+                    "match_count": settings.rag_match_count,
+                    "rrf_k": settings.rag_rrf_k,
+                },
+            )
+        else:
+            rpc = store.rpc(
+                "match_documents",
+                {
+                    "query_embedding": embedding,
+                    "match_threshold": threshold,
+                    "match_count": settings.rag_match_count,
+                },
+            )
         result = rpc.execute()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Falha na busca vetorial (%s): %s", type(exc).__name__, exc)
@@ -188,7 +210,18 @@ def retrieve(settings: Settings, question: str, client) -> list[RetrievedChunk]:
         return []
 
     chunks = [chunk for chunk in (_row_to_chunk(row, threshold=threshold) for row in rows) if chunk]
-    logger.info("Busca vetorial devolveu %d trecho(s)", len(chunks))
+
+    if settings.rag_hybrid:
+        # Na híbrida a ordenação vem do score fundido. `reverse=True` porque
+        # o maior score fundido é o melhor, enquanto a similaridade isolada
+        # pode vir None nos trechos que entraram só pelo texto.
+        chunks.sort(key=lambda c: c.score if c.score is not None else -1.0, reverse=True)
+
+    logger.info(
+        "Busca %s devolveu %d trecho(s)",
+        "híbrida" if settings.rag_hybrid else "vetorial",
+        len(chunks),
+    )
     return chunks
 
 

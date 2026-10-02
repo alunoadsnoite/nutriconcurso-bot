@@ -26,24 +26,59 @@ Rode os testes com `pip install -r requirements-dev.txt` e depois `pytest`.
 Eles **não precisam de `OPENAI_API_KEY`**: o cliente OpenAI é substituído por um
 dublê, então o caminho real da requisição é exercitado sem gastar token.
 
+### Teste de fumaça, contra os serviços de verdade
+
+A suíte inteira roda com dublê, e dublê não prova duas coisas: que o PostgREST
+converte o embedding em `vector`, e que o esquema do banco é o que o código
+espera. Para isso:
+
+```bash
+OPENAI_API_KEY=sk-... \
+SUPABASE_URL=https://seuprojeto.supabase.co \
+SUPABASE_KEY=eyJ... \
+python -m scripts.smoke
+```
+
+Ele insere um trecho com `source` único, pergunta, imprime o que voltou e apaga
+tudo. Sem credencial ele falha dizendo o que falta — não finge que passou.
+
+Depois de mexer no formato dos eventos SSE, regere o fixture que o app consome:
+
+```bash
+python -m scripts.gerar_fixture_stream   # e depois npm test no app
+```
+
 ## Endpoints
 
 ### `POST /api/v1/chat`
 
 ```jsonc
 //requisição
-{ "message": "Qual o Fator de Correção do PNAE para creche?", "user_id": "ana" }
+{
+  "message": "Qual o Fator de Correção do PNAE para creche?",
+  "user_id": "ana",
+  "include_suggestions": true   // opcional, padrão true
+}
 
 //resposta com RAG ligado
 {
-  "reply": "...",
+  "reply": "A UAN equivale a 1400 kcal [[fonte:1]] por pessoa ao dia.",
   "has_history": true,
   "rag_used": true,
-  "sources": [ { "source": "Resolucao_CD_FNDE.pdf", "page": 12 } ]
+  "sources": [ { "source": "Resolucao_CD_FNDE.pdf", "page": 12 } ],
+  "citations": [1],
+  "suggestions": [ "E para creche?", "E para ensino fundamental?" ]
 }
 
 //resposta sem RAG (ou sem trecho acima do limiar)
-{ "reply": "...", "has_history": true, "rag_used": false, "sources": [] }
+{
+  "reply": "...",
+  "has_history": true,
+  "rag_used": false,
+  "sources": [],
+  "citations": [],
+  "suggestions": [ "..." ]
+}
 ```
 
 `user_id` é opcional. Sem ele a chamada é isolada; com ele a API guarda o
@@ -52,6 +87,51 @@ histórico da conversa e o reenvia ao modelo nas chamadas seguintes.
 `rag_used: false` com `sources: []` significa que a resposta saiu do modelo sem
 documento de apoio. O app mostra um aviso nessa situação — é o que evita o
 estudante ler memória do modelo como se fosse norma.
+
+### `POST /api/v1/chat/stream`
+
+Mesma entrada da rota anterior, resposta em Server-Sent Events.
+
+```text
+event: sources
+data: {"sources":[{"source":"Resolucao_CD_FNDE.pdf","page":12}]}
+
+event: token
+data: {"t":"A UAN equivale a 1400 "}
+
+event: suggestions
+data: {"suggestions":["E para creche?"]}
+
+event: done
+data: {"citations":[1]}
+```
+
+Se algo falhar no meio, vem `event: error` com `data: {"detail": "..."}` e a
+conexão fecha. O stream sempre termina em `done` ou `error`, nunca fica
+aberto.
+
+`sources` vem antes do texto de propósito: o app mostra os documentos
+consultados enquanto a frase ainda está sendo escrita.
+
+Sobre o texto que chega em `token`: ele já passou pela mesma validação de
+citações da rota sem stream, e é byte a byte o que foi guardado no histórico.
+Citação para um bloco que não veio na busca é removida antes de sair, e não
+depois — texto já exibido não se recupera. O preço é que a limpeza de espaçamento
+ao redor do marcador não é feita: os dois caminhos preservam o espaçamento
+original para não divergirem entre si.
+
+`/health` traz `streaming: true` quando esta rota existe, para o app descobrir
+a capacidade em vez de adivinhar.
+
+### `GET /api/v1/chat?user_id=ana`
+
+Histórico guardado, para o app restaurar a tela ao ser reaberto.
+
+```json
+{ "messages": [ { "role": "user", "content": "..." }, { "role": "assistant", "content": "..." } ] }
+```
+
+Usuário sem histórico devolve `{"messages": []}`, não erro.
 
 ### `DELETE /api/v1/chat?user_id=ana`
 
@@ -65,7 +145,8 @@ Limpa o histórico de um usuário. Usado pelo botão "Nova conversa" do app.
   "configured": true,
   "model": "gpt-4o-mini",
   "rag_configured": true,
-  "embedding_model": "text-embedding-3-small"
+  "embedding_model": "text-embedding-3-small",
+  "streaming": true
 }
 ```
 
@@ -133,6 +214,7 @@ delete from public.documents where metadata->>'source' = 'Manual_PNAE_2023.pdf';
 | `RAG_MATCH_COUNT` | `5` | Quantos trechos entram no contexto |
 | `RAG_MAX_CHUNK_CHARS` | `1200` | Corte por trecho |
 | `RAG_MAX_CONTEXT_CHARS` | `8000` | Teto do contexto inteiro |
+| `RAG_HYBRID` | `false` | Vetorial + full-text em português, fundidas por RRF. Exige `migrations/002_busca_hibrida.sql` |
 | `EMBEDDING_DIMENSIONS` | `1536` | Tem que bater com a coluna `VECTOR(n)` |
 
 A busca já vem ordenada por similaridade, então os primeiros trecho pesam mais:
@@ -159,8 +241,15 @@ O que a API já faz para reduzir dano:
   `match_documents`, que é `security definer` com `search_path` travado. O
   `insert` fica restrito a quem tem permissão — o ingestion usa a
   `service_role`, e ela nunca deve ser versionada nem digitada no app.
-- **Rate limit por IP** (`REQUESTS_PER_MINUTE`, padrão 20/min, janela
-  deslizante) com `Retry-After` no `429`.
+- **Rate limit duplo**: por endereço (`REQUESTS_PER_MINUTE`, padrão 20/min) e por
+  pessoa (`REQUESTS_PER_MINUTE_PER_USER`, padrão 40/min, pelo `user_id`). O
+  segundo é o que segura um aluno consumindo a cota inteira, já que trocar de
+  endereço não ajuda. Ambos em janela deslizante, com `Retry-After` no `429`.
+- **`X-Forwarded-For` é ignorado por padrão.** O cabeçalho é controlado por
+  quem faz a requisição, então aceitá-lo sem proxy à frente permitia mandar um
+  IP novo a cada chamada e escapar do limite inteiro. Só passa a valer com
+  `TRUST_PROXY=true`, e ainda assim o proxy tem de sobrescrever o cabeçalho em
+  vez de anexar.
 - **Erros da OpenAI não vazam para o cliente.** A mensagem original vai só para
   o log do servidor; o corpo da resposta recebe um texto genérico e um status
   estável. Isso evita expor nomes de projeto, ids de requisição e trechos de
@@ -172,9 +261,14 @@ O que falta para produção, em ordem de prioridade:
 1. **Autenticação por usuário** no servidor (login/sessão) e orçamento gasto por
    usuário. Sem isso, uma chave vazada vira uma fatura aberta.
 2. **Histórico persistente** — hoje é em memória (ver abaixo).
-3. **TLS** obrigatório e `X-Forwarded-For` só confiável atrás de proxy próprio
-   (hoje o código aceita o header, o que permite burlar o rate limit se a API
-   estiver exposta direto).
+3. **TLS obrigatório** e proxy que sobrescreva `X-Forwarded-For` (o código já
+   trata isso, mas a proteção só vale se o proxy não repetir o que o cliente
+   mandou).
+
+> O limite por `user_id` não é autenticação: o identificador vem do próprio
+> cliente e pode ser trocado a cada requisição. Ele contém o custo de um aluno
+> desleixado, não de alguém decidido a atacar. Quem resolve de verdade é o item
+> 1.
 
 ## Limitações conhecidas
 
@@ -202,6 +296,8 @@ O que falta para produção, em ordem de prioridade:
   separada.
 - **Sem cache de embedding.** Pergunta repetida gera nova chamada e novo custo,
   tanto no chat quanto na ingestão.
+- **As sugestões dobram as chamadas.** Cada resposta com `SUGGESTIONS_COUNT > 0`
+  faz uma segunda chamada, curta. Ponha `0` se a cota apertar.
 - **`RAG_MATCH_THRESHOLD` é chato de ajustar.** Não há métrica no repositório
   (recall@k, groundedness); a calibragem é no olho.
 

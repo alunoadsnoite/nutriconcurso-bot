@@ -31,19 +31,29 @@ def require_api_key(
 
 
 class RateLimiter:
-    """Janela deslizante simples, por IP. Em memória, por processo."""
+    """Janela deslizante simples, por chave. Em memória, por processo.
 
-    def __init__(self, *, requests_per_minute: int) -> None:
+    Usa `len(hits) >= limit`, não `>`, e por isso o primeiro dispare de 429 vem
+    na requisição `limit + 1`. Isso é intencional: `limit` pedidos podem
+    passar, e o limite é de `limit` por janela, não de `limit + 1`.
+    """
+
+    def __init__(self, *, requests_per_minute: int, namespace: str = "ip") -> None:
         self._limit = requests_per_minute
+        self._namespace = namespace
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = Lock()
 
     def check(self, client_id: str) -> None:
+        if self._limit <= 0:
+            return
+
         now = monotonic()
         cutoff = now - 60.0
+        key = f"{self._namespace}:{client_id}"
 
         with self._lock:
-            hits = self._hits[client_id]
+            hits = self._hits[key]
             while hits and hits[0] < cutoff:
                 hits.popleft()
 
@@ -58,10 +68,19 @@ class RateLimiter:
             hits.append(now)
 
 
-def client_ip(request: Request) -> str:
-    # Só confie em X-Forwarded-For se você realmente está atrás de um proxy
-    # que o rewrite; caso contrário o cliente falsifica o IP e burla o limite.
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+def client_ip(request: Request, *, trust_proxy: bool = False) -> str:
+    """Endereço usado para contabilizar limite.
+
+    `X-Forwarded-For` **só** é lido com `trust_proxy=True`. Sem isso, qualquer
+    cliente manda o cabeçalho que quiser e cada requisição cai num balde
+    diferente — o rate limit inteiro deixa de valer. Ative apenas se a
+    aplicação estiver atrás de um proxy que **remove** o cabeçalho recebido e
+    reescreve o dele (nginx `proxy_set_header X-Forwarded-For $remote_addr`;
+    Cloudflare e Render já fazem isso).
+    """
+    if trust_proxy:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+
     return request.client.host if request.client else "desconhecido"

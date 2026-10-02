@@ -7,6 +7,8 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     # Opcional: sem ele a conversa não é guardada entre requisições.
     user_id: str | None = Field(default=None, max_length=128)
+    # Gera as perguntas de continuação (uma chamada extra, pequena).
+    include_suggestions: bool = True
 
 
 class SourceItem(BaseModel):
@@ -14,6 +16,15 @@ class SourceItem(BaseModel):
 
     source: str
     page: int | None = None
+
+
+class StoredMessage(BaseModel):
+    role: str
+    content: str
+
+
+class HistoryResponse(BaseModel):
+    messages: list[StoredMessage] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -26,6 +37,12 @@ class ChatResponse(BaseModel):
     # não de uma fonte oficial.
     sources: list[SourceItem] = Field(default_factory=list)
     rag_used: bool = False
+    # Blocos de contexto que o modelo realmente citou, já validados contra o
+    # número de trechos recuperados. Índice 1-based, igual aos rótulos `[1]`,
+    # `[2]` do contexto. Inválidos foram removidos do texto.
+    citations: list[int] = Field(default_factory=list)
+    # Perguntas de continuação para os chips abaixo da resposta.
+    suggestions: list[str] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -34,3 +51,4 @@ class HealthResponse(BaseModel):
     model: str
     rag_configured: bool = False
     embedding_model: str | None = None
+    streaming: bool = True

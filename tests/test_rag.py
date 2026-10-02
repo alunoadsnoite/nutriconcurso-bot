@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.prompts import SYSTEM_PROMPT
-from tests.test_api import FakeClient, FakeCompletions, build_settings
+from tests.test_api import FakeClient, FakeCompletions, build_settings, chat_calls
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -213,12 +213,12 @@ def test_contexto_entra_no_prompt_de_sistema(rag_settings, completions, embeddin
     with _rag_client(rag_settings, completions, store, embeddings) as client:
         client.post("/api/v1/chat", json={"message": "o que diz o artigo 3?"})
 
-    system = completions.calls[0]["messages"][0]["content"]
+    system = chat_calls(completions)[0]["messages"][0]["content"]
     assert system != SYSTEM_PROMPT
     assert "Artigo 3: os serviços de alimentação devem..." in system
     assert "RDC_216.pdf (p. 4)" in system
     assert "=== INÍCIO DO CONTEXTO OFICIAL ===" in system
-    assert completions.calls[0]["messages"][1]["content"] == "o que diz o artigo 3?"
+    assert chat_calls(completions)[0]["messages"][1]["content"] == "o que diz o artigo 3?"
 
 
 def test_sem_trecho_usa_o_prompt_base_e_avisa(rag_settings, completions, embeddings):
@@ -231,7 +231,7 @@ def test_sem_trecho_usa_o_prompt_base_e_avisa(rag_settings, completions, embeddi
     body = response.json()
     assert body["sources"] == []
     assert body["rag_used"] is False
-    system = completions.calls[0]["messages"][0]["content"]
+    system = chat_calls(completions)[0]["messages"][0]["content"]
     assert system == SYSTEM_PROMPT
 
 
@@ -250,7 +250,7 @@ def test_falha_do_rpc_vira_503_sem_vazar_detalhe(rag_settings, completions, embe
     assert "supabase.co" not in detail
     assert "eyJ" not in detail
     # Não pode chamar o modelo: responder sem contexto pareceria fundamento.
-    assert completions.calls == []
+    assert chat_calls(completions) == []
 
 
 def test_falha_nao_openai_no_embedding_vira_503(rag_settings, completions):
@@ -266,7 +266,7 @@ def test_falha_nao_openai_no_embedding_vira_503(rag_settings, completions):
     detail = response.json()["detail"]
     assert detail == "Não foi possível gerar o embedding da pergunta."
     assert "eyJhbGciOi" not in detail
-    assert completions.calls == []
+    assert chat_calls(completions) == []
 
 
 def test_erro_de_conexao_da_openai_no_embedding_vira_502(rag_settings, completions):
@@ -342,7 +342,7 @@ def test_trechos_abaixo_do_limiar_sao_descartados(rag_settings, completions, emb
         response = client.post("/api/v1/chat", json={"message": "oi"})
 
     assert response.json()["sources"] == [{"source": "RDC_216.pdf", "page": 4}]
-    system = completions.calls[0]["messages"][0]["content"]
+    system = chat_calls(completions)[0]["messages"][0]["content"]
     assert "boa" in system
     assert "ruim" not in system
 
@@ -386,7 +386,7 @@ def test_contexto_respeita_o_teto_de_caracteres(rag_settings, completions, embed
     with _rag_client(settings, completions, store, embeddings) as client:
         client.post("/api/v1/chat", json={"message": "oi"})
 
-    system = completions.calls[0]["messages"][0]["content"]
+    system = chat_calls(completions)[0]["messages"][0]["content"]
     bloco = system.split("=== INÍCIO DO CONTEXTO OFICIAL ===")[1]
     trecho = bloco.split("[1] Fonte: Manual.pdf (p. 1)\n")[1].split("\n\n")[0]
     assert len(trecho) <= 304  # 300 + o marcador de corte " […]"
@@ -396,11 +396,11 @@ def test_contexto_respeita_o_teto_de_caracteres(rag_settings, completions, embed
 
 def test_historico_continua_valendo_com_rag_ligado(rag_settings, completions, embeddings, store):
     with _rag_client(rag_settings, completions, store, embeddings) as client:
-        client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana"})
-        segunda = client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana"})
+        client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana", "include_suggestions": False})
+        segunda = client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana", "include_suggestions": False})
 
     assert segunda.json()["has_history"] is True
-    contents = [m["content"] for m in completions.calls[1]["messages"][1:]]
+    contents = [m["content"] for m in chat_calls(completions)[1]["messages"][1:]]
     assert contents == ["primeira", "Resposta com base no contexto.", "segunda"]
 
 

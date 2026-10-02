@@ -53,6 +53,7 @@ def build_settings(**overrides) -> Settings:
         "openai_api_key": "sk-fake-para-teste",
         "api_key": None,
         "requests_per_minute": 1000,
+        "requests_per_minute_per_user": 1000,
         "max_history_messages": 6,
         "history_ttl_seconds": 3600,
     }
@@ -69,6 +70,17 @@ def build_client(settings: Settings, completions: FakeCompletions) -> TestClient
     main_module.get_client = lambda _settings: FakeClient(completions)
     app.state.restore = lambda: setattr(main_module, "get_client", original)
     return TestClient(app, raise_server_exceptions=False)
+
+
+def chat_calls(completions: FakeCompletions) -> list[dict]:
+    """Só as chamadas do tutor.
+
+    A geração de sugestões é uma chamada extra no mesmo cliente, então
+    `completions.calls` mistura as duas. As de suggestions pedem
+    `response_format`, o que dá um filtro explícito em vez de depender de
+    índice.
+    """
+    return [c for c in completions.calls if c.get("response_format") is None]
 
 
 @pytest.fixture
@@ -147,13 +159,13 @@ def test_prompt_de_sistema_e_enviado(settings, completions):
 
 def test_historico_acumula_para_o_mesmo_usuario(settings, completions):
     with build_client(settings, completions) as client:
-        primeira = client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana"})
-        segunda = client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana"})
+        primeira = client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana", "include_suggestions": False})
+        segunda = client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana", "include_suggestions": False})
 
     assert primeira.json()["has_history"] is True
     assert segunda.json()["has_history"] is True
 
-    mensagens = completions.calls[1]["messages"][1:]
+    mensagens = chat_calls(completions)[1]["messages"][1:]
     roles = [m["role"] for m in mensagens]
     contents = [m["content"] for m in mensagens]
     assert roles == ["user", "assistant", "user"]
@@ -162,20 +174,20 @@ def test_historico_acumula_para_o_mesmo_usuario(settings, completions):
 
 def test_historico_nao_vaza_entre_usuarios(settings, completions):
     with build_client(settings, completions) as client:
-        client.post("/api/v1/chat", json={"message": "segredo da ana", "user_id": "ana"})
-        client.post("/api/v1/chat", json={"message": "oi", "user_id": "bruno"})
+        client.post("/api/v1/chat", json={"message": "segredo da ana", "user_id": "ana", "include_suggestions": False})
+        client.post("/api/v1/chat", json={"message": "oi", "user_id": "bruno", "include_suggestions": False})
 
-    contents = [m["content"] for m in completions.calls[1]["messages"][1:]]
+    contents = [m["content"] for m in chat_calls(completions)[1]["messages"][1:]]
     assert contents == ["oi"]
 
 
 def test_historico_esqueca_apos_ttl(completions):
     settings = build_settings(history_ttl_seconds=0)
     with build_client(settings, completions) as client:
-        client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana"})
-        client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana"})
+        client.post("/api/v1/chat", json={"message": "primeira", "user_id": "ana", "include_suggestions": False})
+        client.post("/api/v1/chat", json={"message": "segunda", "user_id": "ana", "include_suggestions": False})
 
-    contents = [m["content"] for m in completions.calls[1]["messages"][1:]]
+    contents = [m["content"] for m in chat_calls(completions)[1]["messages"][1:]]
     assert contents == ["segunda"]
 
 
@@ -192,12 +204,34 @@ def test_limite_de_requisicoes_responde_429(completions):
     assert respostas[-1].headers.get("Retry-After")
 
 
-def test_limite_por_ip_nao_vaza_entre_ips(completions):
-    settings = build_settings(requests_per_minute=1)
+def test_x_forwarded_for_nao_burla_o_limite_por_padrao(completions):
+    """Sem proxy configurado, o cabeçalho é ignorado.
+
+    Este é o teste do problema que existia: o limitador confiava em
+    `X-Forwarded-For` sem condição, então qualquer cliente se livrava do limite
+    mandando um IP diferente por requisição.
+    """
+    settings = build_settings(requests_per_minute=2)
     with build_client(settings, completions) as client:
-        primeiro = client.post("/api/v1/chat", json={"message": "a"}, headers={"x-forwarded-for": "1.1.1.1"})
-        segundo = client.post("/api/v1/chat", json={"message": "b"}, headers={"x-forwarded-for": "2.2.2.2"})
-        terceiro = client.post("/api/v1/chat", json={"message": "c"}, headers={"x-forwarded-for": "1.1.1.1"})
+        codigos = [
+            client.post(
+                "/api/v1/chat",
+                json={"message": f"m{i}", "include_suggestions": False},
+                headers={"x-forwarded-for": f"10.0.0.{i}"},
+            ).status_code
+            for i in range(5)
+        ]
+
+    assert codigos == [200, 200, 429, 429, 429]
+
+
+def test_x_forwarded_for_serve_quando_o_proxy_e_confiado(completions):
+    """Com `trust_proxy=True`, o limitador volta a separar por IP real."""
+    settings = build_settings(requests_per_minute=1, trust_proxy=True)
+    with build_client(settings, completions) as client:
+        primeiro = client.post("/api/v1/chat", json={"message": "a", "include_suggestions": False}, headers={"x-forwarded-for": "1.1.1.1"})
+        segundo = client.post("/api/v1/chat", json={"message": "b", "include_suggestions": False}, headers={"x-forwarded-for": "2.2.2.2"})
+        terceiro = client.post("/api/v1/chat", json={"message": "c", "include_suggestions": False}, headers={"x-forwarded-for": "1.1.1.1"})
 
     assert primeiro.status_code == 200
     assert segundo.status_code == 200
@@ -259,13 +293,13 @@ def test_resposta_vazia_vira_502(completions):
 
 def test_limpar_conversation_de_um_usuario_nao_afeta_outros(settings, completions):
     with build_client(settings, completions) as client:
-        client.post("/api/v1/chat", json={"message": "da ana", "user_id": "ana"})
-        client.post("/api/v1/chat", json={"message": "do bruno", "user_id": "bruno"})
+        client.post("/api/v1/chat", json={"message": "da ana", "user_id": "ana", "include_suggestions": False})
+        client.post("/api/v1/chat", json={"message": "do bruno", "user_id": "bruno", "include_suggestions": False})
 
         resposta = client.request("DELETE", "/api/v1/chat", params={"user_id": "ana"})
         assert resposta.json()["cleared"] is True
 
-        client.post("/api/v1/chat", json={"message": "de novo", "user_id": "bruno"})
+        client.post("/api/v1/chat", json={"message": "de novo", "user_id": "bruno", "include_suggestions": False})
 
-    conteudo_bruno = [m["content"] for m in completions.calls[-1]["messages"][1:]]
+    conteudo_bruno = [m["content"] for m in chat_calls(completions)[-1]["messages"][1:]]
     assert "da ana" not in conteudo_bruno
